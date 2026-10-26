@@ -1,16 +1,36 @@
 'use client';
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { api, onUnauthorized, STATUS_QUERY_KEY } from '@/lib/client-api';
+import {
+  canDismissAuthModal,
+  gateInputFromStatus,
+  gateInputFromUnauthorized,
+  resolveAuthGate,
+  shouldRecheckSessionBeforeLock,
+} from '@/lib/auth-gate';
 import { applyEnvPresets } from '@/lib/subscription-sync';
 import type { AuthStatusResponse } from '@/lib/types';
 import { useToast } from './toast';
 
 /**
  * 认证上下文：
- * - 页面加载时查询 /api/status 判断会话有效性；
- * - 任何 API 返回 401/503 时全局打开登录框（客户端 API 层统一触发，不再散落检查）。
+ * - 页面加载时查询 /api/status；PASSWORD 已配置且会话未验证时立刻强制打开登录框，
+ *   不等待后续接口 401；
+ * - 未验证，或服务器未配置 PASSWORD 时，登录框不能靠遮罩、Escape 或关闭控件卸掉，
+ *   背后的主界面同时 inert，不能把站点当成已登录在用；
+ * - 任何 API 返回 401/503 时同样锁住（客户端 API 层统一触发）。
  */
 
 type SetupRequired = boolean;
@@ -39,14 +59,22 @@ export function useAuth(): AuthContextValue {
   return useContext(AuthContext);
 }
 
+/** 弹层内可聚焦元素（焦点循环，避免 Tab 逃到背后的搜索框） */
+const FOCUSABLE =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [checked, setChecked] = useState(false);
   const [verified, setVerified] = useState(false);
   const [setupRequired, setSetupRequired] = useState(false);
+  /** null：/api/status 还没说明是否配置了 PASSWORD */
+  const [passwordRequired, setPasswordRequired] = useState<boolean | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const { toast } = useToast();
   const queryClient = useQueryClient();
+  const verifiedRef = useRef(false);
+  verifiedRef.current = verified;
 
   // 与 Providers 共用同一 query key 与缓存，避免 /api/status 被请求两次
   useEffect(() => {
@@ -55,8 +83,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .fetchQuery({ queryKey: STATUS_QUERY_KEY, queryFn: () => api.status() })
       .then((s) => {
         if (cancelled) return;
-        setVerified(s.verified);
-        setSetupRequired(!s.passwordRequired);
+        const next = gateInputFromStatus(s);
+        setVerified(next.verified);
+        setPasswordRequired(next.passwordRequired);
+        setSetupRequired(next.setupRequired);
         setVersion(s.version);
         setChecked(true);
       })
@@ -71,15 +101,49 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(
     () =>
       onUnauthorized((event) => {
-        const setup = (event as CustomEvent).detail === 'setup';
-        setSetupRequired(setup);
-        setVerified(false);
-        setModalOpen(true);
+        const detail = (event as CustomEvent).detail;
+        const next = gateInputFromUnauthorized(detail);
+        const apply = () => {
+          setSetupRequired(next.setupRequired);
+          setPasswordRequired(next.passwordRequired);
+          setVerified(next.verified);
+          setModalOpen(next.requestedOpen);
+        };
+        // 登录前发出的请求可能在登录成功后才 401。此时会话 cookie 已生效，
+        // 向 /api/status 复核，避免把刚进来的用户再次锁在不可关闭的登录框里。
+        if (shouldRecheckSessionBeforeLock(verifiedRef.current, detail)) {
+          void api
+            .status()
+            .then((s) => {
+              if (!s.verified) apply();
+            })
+            .catch(() => apply());
+          return;
+        }
+        apply();
       }),
     []
   );
 
+  const gate = useMemo(
+    () =>
+      resolveAuthGate({
+        passwordRequired,
+        verified,
+        setupRequired,
+        requestedOpen: modalOpen,
+      }),
+    [passwordRequired, verified, setupRequired, modalOpen]
+  );
+
   const openLogin = useCallback(() => setModalOpen(true), []);
+
+  // 遮罩、Esc、关闭控件最终都进这里。未验证时 canDismiss 为 false，
+  // 而且即便 modalOpen 被清掉，resolveAuthGate 仍会要求弹层保持挂载。
+  const requestClose = useCallback(() => {
+    if (!canDismissAuthModal(gate)) return;
+    setModalOpen(false);
+  }, [gate]);
 
   const logout = useCallback(async () => {
     try {
@@ -92,6 +156,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const handleLoginSuccess = useCallback(async () => {
     setVerified(true);
+    // 登录成功即说明 PASSWORD 已配置；status 若此前失败，也不能漏掉这个事实
+    setPasswordRequired(true);
     setSetupRequired(false);
     setModalOpen(false);
     // 登录前以 401 失败的查询（如豆瓣推荐）需要重新拉取
@@ -114,14 +180,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [toast, queryClient]);
 
+  const locked = gate.open && !gate.dismissible;
+
   return (
     <AuthContext.Provider value={{ checked, verified, setupRequired, version, openLogin, logout }}>
-      {children}
-      {modalOpen && (
+      {/* 未验证时主界面不接收指针和键盘；弹层是兄弟节点，不受 inert 影响 */}
+      <div
+        inert={locked ? true : undefined}
+        aria-hidden={locked ? true : undefined}
+        className={locked ? 'pointer-events-none' : undefined}
+      >
+        {children}
+      </div>
+      {/* 是否挂载只看 resolveAuthGate。setModalOpen(false) 在未验证时不会卸掉弹层。 */}
+      {gate.open && (
         <LoginModal
-          setupRequired={setupRequired}
+          setupRequired={setupRequired || passwordRequired === false}
+          dismissible={gate.dismissible}
           onSuccess={handleLoginSuccess}
-          onClose={() => setModalOpen(false)}
+          onClose={requestClose}
         />
       )}
     </AuthContext.Provider>
@@ -130,10 +207,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
 function LoginModal({
   setupRequired,
+  dismissible,
   onSuccess,
   onClose,
 }: {
   setupRequired: boolean;
+  dismissible: boolean;
   onSuccess: () => void;
   onClose: () => void;
 }) {
@@ -141,17 +220,58 @@ function LoginModal({
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const dismissibleRef = useRef(dismissible);
+  dismissibleRef.current = dismissible;
 
   useEffect(() => {
-    inputRef.current?.focus();
+    if (inputRef.current) inputRef.current.focus();
+    else panelRef.current?.focus();
+  }, [setupRequired]);
+
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prev;
+    };
   }, []);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') {
+        // 捕获阶段拦住，避免 Esc 先把背后的抽屉/搜索历史关掉，或在未验证时被当成关闭。
+        e.preventDefault();
+        e.stopPropagation();
+        if (canDismissAuthModal({ open: true, dismissible: dismissibleRef.current })) onClose();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const panel = panelRef.current;
+      if (!panel) return;
+      const nodes = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+        (el) => el.getClientRects().length > 0 || el === document.activeElement
+      );
+      if (nodes.length === 0) {
+        e.preventDefault();
+        panel.focus();
+        return;
+      }
+      const first = nodes[0];
+      const last = nodes[nodes.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey) {
+        if (active === first || !panel.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || !panel.contains(active)) {
+        e.preventDefault();
+        first.focus();
+      }
     };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    window.addEventListener('keydown', handler, true);
+    return () => window.removeEventListener('keydown', handler, true);
   }, [onClose]);
 
   const submit = async () => {
@@ -171,18 +291,34 @@ function LoginModal({
     }
   };
 
+  const onBackdropClick = (e: MouseEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // 未验证时点遮罩只是把焦点留在密码框里，不能卸掉弹层。
+    if (!canDismissAuthModal({ open: true, dismissible })) {
+      inputRef.current?.focus();
+      return;
+    }
+    onClose();
+  };
+
   return (
     <div
-      className="fixed inset-0 z-[95] flex items-center justify-center bg-black/80 animate-fade-in"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+      className="fixed inset-0 z-[95] flex items-center justify-center bg-black/80 animate-fade-in overscroll-none"
+      onMouseDown={(e) => {
+        // 阻止点击穿透到背后的搜索框（移动端松手时元素已卸掉会把同一次点击交下去）
+        if (e.target === e.currentTarget) e.preventDefault();
       }}
+      onClick={onBackdropClick}
     >
       <div
-        className="bg-surface-raised rounded-xl p-6 w-full max-w-sm mx-4 shadow-2xl"
+        ref={panelRef}
+        className="bg-surface-raised rounded-xl p-6 w-full max-w-sm mx-4 shadow-2xl outline-none"
         role="dialog"
         aria-modal="true"
         aria-label={setupRequired ? '需要配置密码' : '访问验证'}
+        tabIndex={-1}
       >
         {setupRequired ? (
           <>
